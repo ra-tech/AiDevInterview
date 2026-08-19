@@ -1,0 +1,22 @@
+# Dependencies
+**/node_modules
+
+# Environment variables (contains secrets — never commit)
+**/.env
+**/.env.local
+
+# Build outputs
+frontend/dist
+backend/dist
+
+# Logs
+**/*.log
+npm-debug.log*
+
+# Editor/OS
+.DS_Store
+.vscode
+.idea
+
+# Prisma
+backend/prisma/*.db

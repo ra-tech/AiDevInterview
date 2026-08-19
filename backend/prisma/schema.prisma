@@ -1,0 +1,287 @@
+// DevInterview AI — Prisma schema
+// Design notes:
+// - Every "AI output" table (InterviewPlan, AnswerEvaluation, InterviewReport, SkillScore)
+//   stores the raw structured JSON the model returned (`raw` Json field) alongside typed
+//   columns for the parts the app actually queries on. This means a prompt/schema change
+//   never loses historical data, and we can re-derive typed fields via a migration script.
+// - CandidateAnswer is immutable once created (see section 21: no editing submitted answers).
+//   Enforcement lives in the API layer, not the DB, but the schema has no "updatedAt" on it
+//   as a deliberate signal that it isn't meant to change.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Auth / Identity ----------
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  name            String?
+  createdAt       DateTime  @default(now())
+
+  profile         CandidateProfile?
+  interviews      Interview[]
+  jobDescriptions JobDescription[]
+  resumes         Resume[]
+}
+
+model CandidateProfile {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  targetRole    String?
+  experienceLevel ExperienceLevel?
+  primarySkills String[] @default([])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Job Description Intelligence ----------
+
+model JobDescription {
+  id          String   @id @default(cuid())
+  userId      String
+  rawText     String   @db.Text
+  extracted   Json?    // { role, required_skills, preferred_skills, responsibilities, experience_expectations, important_keywords }
+  createdAt   DateTime @default(now())
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interviews Interview[]
+}
+
+// Deliberately no separate AI extraction/schema for resumes the way JobDescription has one —
+// the raw text is passed as grounding context into interview-plan and question-generation
+// prompts (see buildInterviewPlanPrompt/buildQuestionPrompt) rather than parsed into
+// structured fields. That keeps this feature to one fewer AI call than a full extraction
+// pipeline would need, while still letting the interviewer reference specific projects/
+// experience instead of asking generic questions.
+model Resume {
+  id        String   @id @default(cuid())
+  userId    String
+  rawText   String   @db.Text
+  createdAt DateTime @default(now())
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interviews Interview[]
+}
+
+// ---------- Interview Core ----------
+
+enum ExperienceLevel {
+  INTERN
+  ENTRY_LEVEL
+  ONE_TO_THREE_YEARS
+  THREE_TO_FIVE_YEARS
+}
+
+enum TargetRole {
+  FRONTEND_DEVELOPER
+  BACKEND_DEVELOPER
+  FULL_STACK_DEVELOPER
+  SOFTWARE_DEVELOPMENT_ENGINEER
+  DATA_ENGINEER
+  EMBEDDED_SOFTWARE_ENGINEER
+}
+
+enum InterviewState {
+  CREATED
+  PLANNING
+  IN_PROGRESS
+  CODING_CHALLENGE
+  COMPLETED
+  EVALUATED
+  ABANDONED
+}
+
+model Interview {
+  id               String          @id @default(cuid())
+  userId           String
+  targetRole       TargetRole
+  experienceLevel  ExperienceLevel
+  skills           String[]        @default([])
+  durationMinutes  Int
+  jobDescriptionId String?
+  resumeId         String?
+  state            InterviewState  @default(CREATED)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime        @default(now())
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobDescription JobDescription? @relation(fields: [jobDescriptionId], references: [id])
+  resume         Resume?         @relation(fields: [resumeId], references: [id])
+
+  plan             InterviewPlan?
+  questions        InterviewQuestion[]
+  codingChallenges CodingChallenge[]
+  report           InterviewReport?
+  skillScores      SkillScore[]
+
+  @@index([userId, createdAt])
+}
+
+// The internal plan (section 2). Never surfaced to the candidate verbatim.
+model InterviewPlan {
+  id          String   @id @default(cuid())
+  interviewId String   @unique
+  sections    Json     // [{ type, duration }]
+  raw         Json?    // full structured model output for audit/debug
+  createdAt   DateTime @default(now())
+
+  interview Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+}
+
+enum QuestionType {
+  INTRODUCTION
+  CONCEPTUAL
+  FOLLOW_UP
+  CODING
+  BEHAVIORAL
+  CANDIDATE_QUESTIONS
+}
+
+model InterviewQuestion {
+  id            String       @id @default(cuid())
+  interviewId   String
+  sequence      Int          // ordering within the interview
+  section       String       // e.g. "javascript", "react", "coding" — matches plan section type
+  type          QuestionType
+  prompt        String       @db.Text
+  parentId      String?      // set when this question is a follow-up to another question
+  difficulty    Int          @default(3) // 1-5, adjusted by the skill model
+  askedAt       DateTime     @default(now())
+
+  interview Interview          @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  parent    InterviewQuestion? @relation("FollowUps", fields: [parentId], references: [id])
+  followUps InterviewQuestion[] @relation("FollowUps")
+
+  answer     CandidateAnswer?
+  codingChallenge CodingChallenge?
+
+  @@index([interviewId, sequence])
+}
+
+// Immutable once created — see section 21 (no editing submitted answers).
+model CandidateAnswer {
+  id          String   @id @default(cuid())
+  questionId  String   @unique
+  content     String   @db.Text
+  submittedAt DateTime @default(now())
+
+  question   InterviewQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  evaluation AnswerEvaluation?
+}
+
+model AnswerEvaluation {
+  id                    String   @id @default(cuid())
+  answerId              String   @unique
+  technicalAccuracy     Int      // 0-10
+  problemSolving        Int
+  communication         Int
+  depthOfUnderstanding  Int
+  coveredConcepts       String[] @default([])
+  missedConcepts        String[] @default([])
+  explanation           String   @db.Text
+  suggestedAnswer       String?  @db.Text
+  raw                   Json?    // full structured model output
+  createdAt             DateTime @default(now())
+
+  answer CandidateAnswer @relation(fields: [answerId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Coding (Phase 2 — schema included now so Phase 1 doesn't need a breaking migration) ----------
+
+model CodingChallenge {
+  id              String   @id @default(cuid())
+  interviewId     String
+  questionId      String   @unique
+  title           String
+  statement       String   @db.Text
+  constraints     String?  @db.Text
+  examples        Json     // [{ input, output, explanation? }]
+  functionName    String   @default("solve") // needed to build the execution harness — see coderunner/harness.ts
+  starterCode     Json     // { javascript: "...", python: "...", ... }
+  visibleTests    Json     // [{ input, expectedOutput }]
+  hiddenTests     Json     // never sent to the client
+  createdAt       DateTime @default(now())
+
+  interview Interview          @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  question  InterviewQuestion  @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  submissions CodeSubmission[]
+}
+
+model CodeSubmission {
+  id                String   @id @default(cuid())
+  codingChallengeId String
+  language          String
+  code              String   @db.Text
+  passedVisible     Int
+  totalVisible      Int
+  passedHidden      Int?
+  totalHidden       Int?
+  aiReview          Json?    // { correctness, timeComplexity, spaceComplexity, readability, edgeCases, followUps }
+  submittedAt       DateTime @default(now())
+
+  codingChallenge CodingChallenge @relation(fields: [codingChallengeId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Reporting ----------
+
+model InterviewReport {
+  id                   String   @id @default(cuid())
+  interviewId          String   @unique
+  overallScore         Int      // 0-100
+  technicalKnowledge   Int
+  problemSolving       Int
+  coding               Int
+  communication        Int
+  depthOfUnderstanding Int
+  roleFit              Int
+  strengths            String[] @default([])
+  weaknesses           String[] @default([])
+  evidence             Json     // [{ topic, score, narrative }]
+  studyPlan            Json     // [{ priority, title, why, practice: [] }]
+  raw                  Json?
+  createdAt            DateTime @default(now())
+
+  interview Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+}
+
+// Per-topic rollup used by the candidate progress dashboard (section 11)
+model SkillScore {
+  id          String   @id @default(cuid())
+  userId      String
+  interviewId String
+  topic       String   // "React", "JavaScript", "DSA", "DBMS", "System Design", ...
+  score       Int      // 0-100
+  createdAt   DateTime @default(now())
+
+  interview Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([userId, topic])
+}
+
+// ---------- Analytics (Phase 4) ----------
+
+// Minimal product-analytics event log (spec section 22). Deliberately narrow: no free-form
+// PII, no session replay data — just enough to see funnel drop-off (created -> started ->
+// answered -> completed -> report viewed) and coding-challenge engagement.
+model AnalyticsEvent {
+  id          String   @id @default(cuid())
+  userId      String?
+  interviewId String?
+  name        String // "interview_created" | "interview_started" | "answer_submitted" | ...
+  metadata    Json? // small, non-sensitive context only (e.g. { targetRole, durationMinutes })
+  createdAt   DateTime @default(now())
+
+  @@index([name, createdAt])
+  @@index([userId])
+}
